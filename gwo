@@ -1,0 +1,352 @@
+"""
+triband_ann_gwo_wfq.py
+ANN + GWO (Grey Wolf Optimizer) hyperparameter optimization for tri-band switching (2.4 / 5 / 6 GHz)
+Modified: Added stronger regularization + dropout to avoid overfitting (no more 1.000 acc).
+Added: switching rate (unweighted) and switching rate using a WFQ-style weight column.
+Now also prints Precision, Recall, and Execution Time.
+"""
+
+# --------------------- auto-install required packages if missing ---------------------
+import importlib, subprocess, sys, os
+REQUIRED = ["numpy", "pandas", "matplotlib", "scikit-learn", "tensorflow", "joblib"]
+for pkg in REQUIRED:
+    try:
+        importlib.import_module(pkg)
+    except Exception:
+        print(f"Installing missing package: {pkg} ...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+# --------------------- imports ---------------------
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
+
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score, classification_report, confusion_matrix, f1_score,
+    precision_score, recall_score,
+    roc_curve, auc, precision_recall_curve, average_precision_score
+)
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers, regularizers
+import joblib
+
+# --------------------- user settings ---------------------
+CSV_PATH = "wifi_dataset.csv"      # fallback if not running in Colab
+TEST_SIZE = 0.2
+VAL_SIZE = 0.15
+RANDOM_STATE = 42
+
+# GWO settings
+FAST_MODE = True
+if FAST_MODE:
+    GWO_WOLVES = 8
+    GWO_ITERS = 10
+    GWO_EVAL_EPOCHS = 3
+else:
+    GWO_WOLVES = 20
+    GWO_ITERS = 30
+    GWO_EVAL_EPOCHS = 5
+
+# Expected network metric columns (case-insensitive, flexible matching)
+NETWORK_METRICS_COLS = [
+    "throughput", "latency", "jitter", "packet_loss",
+    "snr", "handoff_delay", "channel_utilization", "interference"
+]
+
+# reproducibility
+np.random.seed(RANDOM_STATE)
+tf.random.set_seed(RANDOM_STATE)
+
+# --------------------- helpers ---------------------
+def build_ann(input_dim, num_classes, hidden1=32, hidden2=16, dropout=0.4, lr=1e-3):
+    model = models.Sequential([
+        layers.Input(shape=(input_dim,)),
+        layers.Dense(int(hidden1), activation='relu',
+                     kernel_regularizer=regularizers.l2(1e-3)),
+        layers.Dropout(float(dropout)),
+        layers.Dense(int(hidden2), activation='relu',
+                     kernel_regularizer=regularizers.l2(1e-3)),
+        layers.Dropout(float(dropout)),
+        layers.Dense(num_classes, activation='softmax')
+    ])
+    model.compile(optimizer=optimizers.Adam(learning_rate=float(lr)),
+                  loss='categorical_crossentropy', metrics=['accuracy'])
+    return model
+
+
+def plot_roc_pr(y_test_onehot, y_score, classes):
+    n_classes = y_test_onehot.shape[1]
+    plt.figure(figsize=(12,5))
+    plt.subplot(1,2,1)
+    for i in range(n_classes):
+        fpr, tpr, _ = roc_curve(y_test_onehot[:, i], y_score[:, i])
+        roc_auc = auc(fpr, tpr)
+        plt.plot(fpr, tpr, label=f"{classes[i]} (AUC={roc_auc:.3f})")
+    plt.plot([0,1],[0,1],'k--'); plt.title("ROC Curves"); plt.xlabel("FPR"); plt.ylabel("TPR"); plt.legend(fontsize=8)
+
+    plt.subplot(1,2,2)
+    for i in range(n_classes):
+        prec, rec, _ = precision_recall_curve(y_test_onehot[:, i], y_score[:, i])
+        ap = average_precision_score(y_test_onehot[:, i], y_score[:, i])
+        plt.plot(rec, prec, label=f"{classes[i]} (AP={ap:.3f})")
+    plt.title("Precision-Recall Curves"); plt.xlabel("Recall"); plt.ylabel("Precision"); plt.legend(fontsize=8)
+    plt.tight_layout(); plt.show()
+
+# --------------------- switching rate helper ---------------------
+def compute_switching_rates_from_predictions(y_pred, df):
+    """Return (unweighted_rate, wfq_weighted_rate).
+
+    Weighted rate uses per-sample weights from the dataset if available; otherwise
+    falls back to normalized 'Channel Utilization (%)' if present; otherwise uses equal weights.
+    """
+    if len(y_pred) <= 1:
+        return 0.0, 0.0
+
+    # Unweighted
+    transitions = (y_pred[1:] != y_pred[:-1]).astype(int)
+    unweighted_rate = transitions.sum() / max(1, len(transitions))
+
+    # Determine weight column
+    weight_candidates = ['WFQ_Weight', 'wfq_weight', 'flow_weight', 'weight']
+    weight_col = None
+    for c in weight_candidates:
+        if c in df.columns:
+            weight_col = c
+            break
+    if weight_col is None and 'Channel Utilization (%)' in df.columns:
+        # normalize to [0,1]
+        arr = pd.to_numeric(df['Channel Utilization (%)'], errors='coerce').fillna(0).values
+        if np.nanmax(arr) - np.nanmin(arr) > 0:
+            weights = (arr - np.nanmin(arr)) / (np.nanmax(arr) - np.nanmin(arr))
+        else:
+            weights = np.ones_like(arr)
+    elif weight_col is not None:
+        weights = pd.to_numeric(df[weight_col], errors='coerce').fillna(0).values
+        # if all zeros or negatives, fallback to ones
+        if np.allclose(weights, 0) or np.nanmax(weights) <= 0:
+            weights = np.ones_like(weights)
+    else:
+        weights = np.ones(len(df))
+
+    # Ensure length match between predictions and weights
+    if len(weights) != len(y_pred):
+        # try to align by trimming/padding
+        if len(weights) > len(y_pred):
+            weights = weights[:len(y_pred)]
+        else:
+            weights = np.pad(weights, (0, len(y_pred) - len(weights)), 'edge')
+
+    # Compute per-transition average weight
+    avg_weights = (weights[1:] + weights[:-1]) / 2.0
+    denom = avg_weights.sum() if avg_weights.sum() > 0 else len(avg_weights)
+    weighted_switch_sum = (avg_weights * transitions).sum()
+    wfq_rate = weighted_switch_sum / denom
+
+    return float(unweighted_rate), float(wfq_rate)
+
+# --------------------- GWO implementation ---------------------
+def init_population(n_wolves, dim, lb, ub):
+    return np.random.uniform(low=lb, high=ub, size=(n_wolves, dim))
+
+def ensure_bounds(position, lb, ub):
+    return np.clip(position, lb, ub)
+
+def particle_to_hparams(p):
+    h1 = int(np.clip(round(p[0]), 16, 64))
+    h2 = int(np.clip(round(p[1]), 8, 32))
+    dropout = float(np.clip(p[2], 0.4, 0.6))  # stronger dropout
+    lr_exp = float(np.clip(p[3], -4.0, -2.0))
+    lr = 10.0 ** lr_exp
+    batch_log = int(np.clip(round(p[4]), 4, 7))
+    batch = int(2 ** batch_log)
+    return dict(hidden1=h1, hidden2=h2, dropout=dropout, lr=lr, batch=batch)
+
+def gwo_optimize(fitness_fn, dim, lb, ub, n_wolves=10, max_iter=20, verbose=True):
+    X = init_population(n_wolves, dim, lb, ub)
+    fitness = fitness_fn(X)
+    idx = np.argsort(fitness)
+    X = X[idx]; fitness = fitness[idx]
+    Alpha_pos, Alpha_score = X[0].copy(), fitness[0]
+    Beta_pos, Beta_score = X[1].copy(), fitness[1]
+    Delta_pos, Delta_score = X[2].copy(), fitness[2]
+    history = []
+
+    for t in range(max_iter):
+        a = 2.0 * (1 - t / float(max_iter))
+        for i in range(n_wolves):
+            for j in range(dim):
+                r1,r2 = np.random.rand(), np.random.rand()
+                A1 = 2*a*r1 - a; C1 = 2*r2
+                D_alpha = abs(C1*Alpha_pos[j] - X[i,j]); X1 = Alpha_pos[j] - A1*D_alpha
+
+                r1,r2 = np.random.rand(), np.random.rand()
+                A2 = 2*a*r1 - a; C2 = 2*r2
+                D_beta = abs(C2*Beta_pos[j] - X[i,j]); X2 = Beta_pos[j] - A2*D_beta
+
+                r1,r2 = np.random.rand(), np.random.rand()
+                A3 = 2*a*r1 - a; C3 = 2*r2
+                D_delta = abs(C3*Delta_pos[j] - X[i,j]); X3 = Delta_pos[j] - A3*D_delta
+
+                X[i,j] = (X1 + X2 + X3)/3.0
+            X[i] = ensure_bounds(X[i], lb, ub)
+        fitness = fitness_fn(X)
+        idx = np.argsort(fitness)
+        X = X[idx]; fitness = fitness[idx]
+
+        if fitness[0] < Alpha_score:
+            Alpha_pos, Alpha_score = X[0].copy(), fitness[0]
+        Beta_pos, Beta_score = X[1].copy(), fitness[1]
+        Delta_pos, Delta_score = X[2].copy(), fitness[2]
+        history.append(Alpha_score)
+        if verbose:
+            print(f"GWO iter {t+1}/{max_iter} - best val loss: {Alpha_score:.6f}")
+    return Alpha_pos, Alpha_score, history
+
+# --------------------- fitness wrapper ---------------------
+def make_fitness(X_train, y_train, X_val, y_val, input_dim, num_classes, eval_epochs=3):
+    def fitness(pop_positions):
+        n = pop_positions.shape[0]
+        losses = np.zeros(n)
+        for i in range(n):
+            h = particle_to_hparams(pop_positions[i])
+            model = build_ann(input_dim, num_classes,
+                              hidden1=h['hidden1'], hidden2=h['hidden2'],
+                              dropout=h['dropout'], lr=h['lr'])
+            es = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=1, restore_best_weights=True)
+            try:
+                model.fit(X_train, y_train, validation_data=(X_val, y_val),
+                          epochs=eval_epochs, batch_size=h['batch'], verbose=0, callbacks=[es])
+                loss,_ = model.evaluate(X_val, y_val, verbose=0)
+                losses[i] = loss
+            except Exception as e:
+                print(f"Fitness eval failed for wolf {i}: {e}")
+                losses[i] = 1e6
+            tf.keras.backend.clear_session()
+        return losses
+    return fitness
+
+# --------------------- main ---------------------
+def main():
+    start_time = time.time()
+
+    # Colab upload
+    csv_path = CSV_PATH
+    try:
+        import google.colab
+        from google.colab import files
+        print("Detected Colab — please upload CSV (last column must be label):")
+        uploaded = files.upload()
+        if uploaded:
+            csv_path = next(iter(uploaded.keys()))
+            print("Uploaded:", csv_path)
+    except Exception:
+        pass
+
+    if not os.path.exists(csv_path):
+        print(f"CSV not found at {csv_path}. Please set CSV_PATH or upload in Colab.")
+        return
+
+    df = pd.read_csv(csv_path).dropna().reset_index(drop=True)
+    print("Loaded:", csv_path, "shape:", df.shape)
+
+    # preprocess
+    X_df = df.iloc[:, :-1].copy()
+    y_raw = df.iloc[:, -1].values
+    cat_cols = X_df.select_dtypes(exclude=[np.number]).columns.tolist()
+    if cat_cols:
+        for col in cat_cols:
+            le_col = LabelEncoder()
+            X_df[col] = le_col.fit_transform(X_df[col].astype(str))
+    X = X_df.apply(pd.to_numeric, errors='coerce').fillna(0.0).values
+
+    label_enc = LabelEncoder()
+    y_enc = label_enc.fit_transform(y_raw)
+    classes = label_enc.classes_
+    num_classes = len(classes)
+    y_onehot = tf.keras.utils.to_categorical(y_enc, num_classes=num_classes)
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    X_trainval, X_test, y_trainval, y_test = train_test_split(
+        X_scaled, y_onehot, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y_enc
+    )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_trainval, y_trainval, test_size=VAL_SIZE, random_state=RANDOM_STATE,
+        stratify=np.argmax(y_trainval, axis=1)
+    )
+    input_dim = X.shape[1]
+
+    # ---- GWO search ----
+    print("\nStarting GWO hyperparameter search...")
+    lb = np.array([16, 8, 0.4, -4.0, 4.0])
+    ub = np.array([64, 32, 0.6, -2.0, 7.0])
+    dim = lb.size
+    fitness = make_fitness(X_train, y_train, X_val, y_val, input_dim, num_classes, eval_epochs=GWO_EVAL_EPOCHS)
+    best_pos, best_score, hist = gwo_optimize(fitness, dim, lb, ub, n_wolves=GWO_WOLVES, max_iter=GWO_ITERS)
+    best_h = particle_to_hparams(best_pos)
+    print("Best hyperparameters:", best_h)
+
+    # ---- final training ----
+    final_model = build_ann(input_dim, num_classes, hidden1=best_h['hidden1'],
+                            hidden2=best_h['hidden2'], dropout=best_h['dropout'], lr=best_h['lr'])
+    cb = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
+    history = final_model.fit(X_trainval, y_trainval, validation_data=(X_val, y_val),
+                              epochs=50, batch_size=best_h['batch'], callbacks=[cb], verbose=1)
+
+    # ---- evaluation ----
+    test_loss, test_acc = final_model.evaluate(X_test, y_test, verbose=0)
+    y_score = final_model.predict(X_test)
+    y_pred = np.argmax(y_score, axis=1)
+    y_true = np.argmax(y_test, axis=1)
+
+    err_rate = 1.0 - test_acc
+    f1_macro = f1_score(y_true, y_pred, average='macro')
+    prec_macro = precision_score(y_true, y_pred, average='macro')
+    rec_macro = recall_score(y_true, y_pred, average='macro')
+
+    # switching rates (unweighted + WFQ-weighted) — use df_test aligned with X_test
+    df_copy = df.copy().reset_index(drop=True)
+    _, idx_test = train_test_split(np.arange(len(df_copy)), test_size=TEST_SIZE,
+                                   random_state=RANDOM_STATE, stratify=label_enc.transform(df_copy.iloc[:, -1].values))
+    df_test = df_copy.iloc[idx_test].reset_index(drop=True)
+
+    unweighted_switch_rate, wfq_switch_rate = compute_switching_rates_from_predictions(y_pred, df_test)
+
+    print("\n=== MODEL METRICS ===")
+    print(f"Test Loss        : {test_loss:.6f}")
+    print(f"Test Accuracy    : {test_acc:.6f}")
+    print(f"Test Error Rate  : {err_rate:.6f}")
+    print(f"Macro F1 Score   : {f1_macro:.6f}")
+    print(f"Macro Precision  : {prec_macro:.6f}")
+    print(f"Macro Recall     : {rec_macro:.6f}")
+    print(f"Switching Rate (unweighted): {unweighted_switch_rate:.6f}")
+    print(f"Switching Rate (WFQ-weighted): {wfq_switch_rate:.6f}\n")
+
+    print("Classification report:")
+    print(classification_report(y_true, y_pred, target_names=[str(c) for c in classes]))
+    print("Confusion matrix:\n", confusion_matrix(y_true, y_pred))
+
+    plot_roc_pr(y_test, y_score, classes)
+
+    # ---- network metrics ----
+    print("\n=== NETWORK METRICS ===")
+    lower_cols = [c.lower().replace(" ", "").replace("(", "").replace(")", "").replace("%", "") for c in df_test.columns.tolist()]
+    for col in NETWORK_METRICS_COLS:
+        matches = [i for i,c in enumerate(lower_cols) if col.lower().replace("_","") in c]
+        if matches:
+            val = pd.to_numeric(df_test.iloc[:, matches[0]], errors='coerce').mean()
+            print(f"{col.title():20s}: {val:.6f}")
+        else:
+            print(f"{col.title():20s}: MISSING")
+
+    elapsed = time.time() - start_time
+    print(f"\nDone — Execution Time: {elapsed:.2f} seconds ({elapsed/60:.2f} minutes)")
+
+if __name__ == "__main__":
+    main()

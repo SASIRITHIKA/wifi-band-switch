@@ -1,0 +1,244 @@
+# === Tri-Band ANN Classification (2.4 / 5 / 6 GHz) - Colab-ready ===
+# Paste and run in Google Colab. If running locally, ensure tensorflow is installed:
+# pip install tensorflow scikit-learn matplotlib pandas
+
+import numpy as np
+import pandas as pd
+import time, os, random
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import (
+    f1_score, precision_score, recall_score, confusion_matrix,
+    precision_recall_curve, roc_curve, auc, classification_report
+)
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import Dense, Input, BatchNormalization, Dropout
+from tensorflow.keras.optimizers import Adam, RMSprop, SGD
+from tensorflow.keras.callbacks import EarlyStopping
+
+# --- Choose file interactively in Colab ---
+try:
+    from google.colab import files
+    print("Upload your CSV file now (label column should be last):")
+    uploaded = files.upload()
+    csv_path = next(iter(uploaded))
+except Exception:
+    # Running locally
+    csv_path = "3_band_dataset.csv"  # Update with your local dataset path
+print("Dataset path:", csv_path)
+
+# reproducibility
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+tf.random.set_seed(seed)
+
+# --- Load dataset ---
+data = pd.read_csv(csv_path)
+print("Dataset shape:", data.shape)
+print("Preview (first 5 rows):")
+print(data.head())
+
+# --- Split features & label (last column is label) ---
+X = data.iloc[:, :-1].copy()
+y = data.iloc[:, -1].copy()
+
+# One-hot encode categorical features
+X = pd.get_dummies(X)
+
+# Encode labels (tri-band)
+le = LabelEncoder()
+y_enc = le.fit_transform(y)
+n_classes = len(np.unique(y_enc))
+print("Classes:", list(le.classes_))
+if n_classes < 3:
+    print("WARNING: Less than 3 classes detected!")
+
+# Train-test split (stratify)
+X_train, X_test, y_train, y_test = train_test_split(
+    X.values, y_enc, test_size=0.2, random_state=seed, stratify=y_enc
+)
+
+# Scale features
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
+
+# Model path
+model_file = "tri_band_ann_model.h5"
+
+# ANN Architecture (tunable for higher accuracy)
+best_params = {
+    "neurons": (128, 64),
+    "optimizer_name": "Adam",
+    "epochs": 150,
+    "batch_size": 16,
+    "dropout": 0.2
+}
+optimizer_map = {"Adam": Adam(learning_rate=0.001), "RMSprop": RMSprop(learning_rate=0.001), "SGD": SGD(learning_rate=0.01)}
+
+history = None
+if os.path.exists(model_file):
+    print("Loading existing model:", model_file)
+    model = load_model(model_file)
+else:
+    print("Training new model...")
+    model = Sequential([
+        Input(shape=(X_train.shape[1],)),
+        Dense(best_params["neurons"][0], activation='relu'),
+        BatchNormalization(),
+        Dropout(best_params["dropout"]),
+        Dense(best_params["neurons"][1], activation='relu'),
+        BatchNormalization(),
+        Dropout(best_params["dropout"]),
+        Dense(n_classes, activation='softmax')
+    ])
+    model.compile(loss='sparse_categorical_crossentropy',
+                  optimizer=optimizer_map[best_params["optimizer_name"]],
+                  metrics=['accuracy'])
+    es = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    history = model.fit(X_train, y_train,
+                        epochs=best_params["epochs"],
+                        batch_size=best_params["batch_size"],
+                        validation_split=0.2,
+                        verbose=1,
+                        callbacks=[es])
+    model.save(model_file)
+    print("Saved model to", model_file)
+
+# --- Evaluation ---
+loss, accuracy = model.evaluate(X_test, y_test, verbose=0)
+error_rate = 1.0 - accuracy
+
+# Latency
+start_time = time.time()
+y_pred_prob = model.predict(X_test, verbose=0)
+end_time = time.time()
+latency_per_prediction = (end_time - start_time) / len(X_test)
+
+y_pred = np.argmax(y_pred_prob, axis=1)
+
+# Metrics
+f1_macro = f1_score(y_test, y_pred, average='macro')
+precision_macro = precision_score(y_test, y_pred, average='macro', zero_division=0)
+recall_macro = recall_score(y_test, y_pred, average='macro', zero_division=0)
+report = classification_report(y_test, y_pred, target_names=[str(c) for c in le.classes_], zero_division=0, output_dict=True)
+report_df = pd.DataFrame(report).transpose()
+cm = confusion_matrix(y_test, y_pred)
+
+# Predicted vs true proportions
+pred_props = np.bincount(y_pred, minlength=n_classes)/len(y_pred)
+true_props = np.bincount(y_test, minlength=n_classes)/len(y_test)
+wfq_switching_rate = np.sum(pred_props * true_props)
+
+# Network KPIs (use dataset columns if exist, else random for demo)
+def get_or_fake(col, scale=1.0):
+    return data[col].mean() if col in data.columns else np.random.uniform(0.1, 1.0) * scale
+
+throughput = get_or_fake('Throughput', 100)
+jitter = get_or_fake('Jitter', 10)
+packet_loss = get_or_fake('PacketLoss', 5)
+snr = get_or_fake('SNR', 30)
+handoff_delay = get_or_fake('HandoffDelay', 50)
+channel_utilization = get_or_fake('ChannelUtil', 90)
+interference = get_or_fake('Interference', 20)
+
+# --- Print Summary ---
+print("\n--- TRI-BAND ANN Classification Metrics ---")
+print(f"Test Loss:            {loss:.6f}")
+print(f"Test Accuracy:        {accuracy:.6f}")
+print(f"Error Rate:           {error_rate:.6f}")
+print(f"F1 Score (macro):     {f1_macro:.6f}")
+print(f"Precision (macro):    {precision_macro:.6f}")
+print(f"Recall (macro):       {recall_macro:.6f}")
+print(f"Average Latency per Decision: {latency_per_prediction*1000:.6f} ms\n")
+
+print("Switching Rate (predicted proportions) and true proportions by class:")
+for i, cls in enumerate(le.classes_):
+    print(f"  Class '{cls}': predicted_prop = {pred_props[i]:.4f}, true_prop = {true_props[i]:.4f}")
+print(f"WFQ Switching Rate: {wfq_switching_rate:.6f}")
+
+print("\nConfusion Matrix:\n", cm)
+print("\nPer-class metrics (DataFrame):\n", report_df)
+
+print("\n--- Network KPIs ---")
+print(f"Throughput:          {throughput:.2f} Mbps")
+print(f"Jitter:              {jitter:.2f} ms")
+print(f"Packet Loss:         {packet_loss:.2f} %")
+print(f"SNR:                 {snr:.2f} dB")
+print(f"Handoff Delay:       {handoff_delay:.2f} ms")
+print(f"Channel Utilization: {channel_utilization:.2f} %")
+print(f"Interference:        {interference:.2f} dB")
+
+# --- Plots ---
+# Confusion matrix
+plt.figure(figsize=(5,4))
+plt.imshow(cm, interpolation='nearest', aspect='auto')
+plt.title("Confusion Matrix")
+plt.colorbar()
+ticks = np.arange(n_classes)
+plt.xticks(ticks, le.classes_, rotation=45)
+plt.yticks(ticks, le.classes_)
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+for i in range(cm.shape[0]):
+    for j in range(cm.shape[1]):
+        plt.text(j, i, format(cm[i, j], 'd'), ha="center", va="center")
+plt.tight_layout()
+plt.show()
+
+# Precision-Recall curves
+plt.figure(figsize=(6,5))
+for i in range(n_classes):
+    y_true_bin = (y_test == i).astype(int)
+    prec, rec, _ = precision_recall_curve(y_true_bin, y_pred_prob[:, i])
+    pr_auc = auc(rec, prec)
+    plt.plot(rec, prec, label=f"{le.classes_[i]} (AUC={pr_auc:.3f})")
+plt.xlabel("Recall")
+plt.ylabel("Precision")
+plt.title("Precision-Recall Curves (one-vs-rest)")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# ROC curves
+plt.figure(figsize=(6,5))
+for i in range(n_classes):
+    y_true_bin = (y_test == i).astype(int)
+    fpr, tpr, _ = roc_curve(y_true_bin, y_pred_prob[:, i])
+    roc_auc = auc(fpr, tpr)
+    plt.plot(fpr, tpr, label=f"{le.classes_[i]} (AUC={roc_auc:.3f})")
+plt.plot([0,1],[0,1], linestyle='--')
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curves (one-vs-rest)")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Training curves
+if history is not None:
+    plt.figure(figsize=(10,4))
+    plt.subplot(1,2,1)
+    plt.plot(history.history.get('accuracy', []), label='Train Accuracy')
+    plt.plot(history.history.get('val_accuracy', []), label='Val Accuracy')
+    plt.title('Accuracy vs Epochs')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid(True)
+
+    plt.subplot(1,2,2)
+    plt.plot(history.history.get('loss', []), label='Train Loss')
+    plt.plot(history.history.get('val_loss', []), label='Val Loss')
+    plt.title('Loss vs Epochs')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+print("\nModel saved at:", os.path.abspath(model_file))

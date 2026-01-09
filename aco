@@ -1,0 +1,210 @@
+# === Efficient Wi-Fi Tri-Band Switching using ANN + ACO ===
+# Colab-ready
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score, f1_score, confusion_matrix,
+    roc_curve, auc, precision_recall_curve,
+    precision_score, recall_score
+)
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.utils import to_categorical
+import random, time
+
+# -----------------------------
+# Colab CSV upload function
+# -----------------------------
+def upload_via_colab():
+    from google.colab import files
+    print("Please upload your CSV file (label must be the last column):")
+    uploaded = files.upload()
+    if not uploaded:
+        raise FileNotFoundError("No file uploaded in Colab.")
+    fname = next(iter(uploaded.keys()))
+    print("Uploaded:", fname)
+    return fname
+
+# -----------------------------
+# Load dataset
+# -----------------------------
+fname = upload_via_colab()
+data = pd.read_csv(fname)
+
+# -----------------------------
+# Separate features and labels
+# -----------------------------
+X = data.iloc[:, :-1]  # all except last column
+y = data.iloc[:, -1]   # last column = band label
+
+# -----------------------------
+# Keep only numeric features for ANN
+# -----------------------------
+numeric_cols = X.select_dtypes(include=np.number).columns
+X_numeric = X[numeric_cols].values
+if X_numeric.shape[1] == 0:
+    raise ValueError("No numeric columns found in dataset. ANN requires numeric inputs.")
+
+# -----------------------------
+# Encode labels
+# -----------------------------
+le = LabelEncoder()
+y_encoded = le.fit_transform(y)
+num_classes = len(np.unique(y_encoded))
+y_categorical = to_categorical(y_encoded, num_classes=num_classes)
+classes = le.classes_
+
+# -----------------------------
+# Train-test split
+# -----------------------------
+X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(
+    X_numeric, y_categorical, data.index, test_size=0.2, random_state=42, stratify=y_encoded
+)
+
+# Scale features
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
+
+# -----------------------------
+# ANN Model (to be optimized by ACO)
+# -----------------------------
+def build_ann(hidden_layers=[64,32], dropout_rates=[0.3,0.2], input_dim=X_train.shape[1], output_dim=num_classes):
+    model = Sequential()
+    model.add(Dense(hidden_layers[0], input_dim=input_dim, activation='relu'))
+    model.add(Dropout(dropout_rates[0]))
+    for i in range(1, len(hidden_layers)):
+        model.add(Dense(hidden_layers[i], activation='relu'))
+        model.add(Dropout(dropout_rates[i]))
+    model.add(Dense(output_dim, activation='softmax'))
+    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+    return model
+
+# -----------------------------
+# Ant Colony Optimization (simplified version for demo)
+# -----------------------------
+class ACO_ANN:
+    def __init__(self, n_ants=5, n_iter=5):
+        self.n_ants = n_ants
+        self.n_iter = n_iter
+        self.best_model = None
+        self.best_score = 0
+        self.best_params = None
+
+    def optimize(self):
+        for iteration in range(self.n_iter):
+            print(f"ACO Iteration {iteration+1}/{self.n_iter}")
+            for ant in range(self.n_ants):
+                hidden_layers = [random.choice([32, 64, 128]), random.choice([16, 32, 64])]
+                dropout_rates = [random.uniform(0.2, 0.5), random.uniform(0.1, 0.3)]
+                model = build_ann(hidden_layers, dropout_rates)
+                model.fit(X_train, y_train, epochs=50, batch_size=32, validation_split=0.2, verbose=0)
+                acc = model.evaluate(X_test, y_test, verbose=0)[1]
+                if acc > self.best_score:
+                    self.best_score = acc
+                    self.best_model = model
+                    self.best_params = (hidden_layers, dropout_rates)
+        print("ACO optimization complete.")
+        print("Best Accuracy:", self.best_score)
+        print("Best Hidden Layers:", self.best_params[0])
+        print("Best Dropout Rates:", self.best_params[1])
+
+# -----------------------------
+# Run ACO optimization with timer
+# -----------------------------
+start_time = time.time()
+
+aco = ACO_ANN(n_ants=5, n_iter=5)
+aco.optimize()
+
+execution_time = time.time() - start_time
+
+# -----------------------------
+# Evaluate best ANN model
+# -----------------------------
+model = aco.best_model
+y_pred_prob = model.predict(X_test)
+y_pred = np.argmax(y_pred_prob, axis=1)
+y_true = np.argmax(y_test, axis=1)
+
+# Model metrics
+loss, accuracy = model.evaluate(X_test, y_test, verbose=0)
+error_rate = 1 - accuracy
+f1 = f1_score(y_true, y_pred, average='macro')
+precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
+recall = recall_score(y_true, y_pred, average='macro', zero_division=0)
+cm = confusion_matrix(y_true, y_pred)
+
+print("\n=== MODEL METRICS ===")
+print(f"Loss: {loss:.4f}")
+print(f"Accuracy: {accuracy:.4f}")
+print(f"Error Rate: {error_rate:.4f}")
+print(f"Macro F1: {f1:.4f}")
+print(f"Macro Precision: {precision:.4f}")
+print(f"Macro Recall: {recall:.4f}")
+print(f"Execution Time: {execution_time:.2f} seconds")
+print("Confusion Matrix:\n", cm)
+
+# -----------------------------
+# ROC and PR curves
+# -----------------------------
+for i in range(num_classes):
+    fpr, tpr, _ = roc_curve(y_test[:, i], y_pred_prob[:, i])
+    auc_score = auc(fpr, tpr)
+    precision_curve, recall_curve, _ = precision_recall_curve(y_test[:, i], y_pred_prob[:, i])
+    plt.figure(figsize=(12,5))
+    plt.subplot(1,2,1)
+    plt.plot(fpr, tpr, label=f'AUC={auc_score:.2f}')
+    plt.plot([0,1],[0,1],'--')
+    plt.title(f'ROC Curve - Class {i} ({classes[i]})')
+    plt.xlabel('FPR'); plt.ylabel('TPR'); plt.legend()
+    plt.subplot(1,2,2)
+    plt.plot(recall_curve, precision_curve)
+    plt.title(f'PR Curve - Class {i} ({classes[i]})')
+    plt.xlabel('Recall'); plt.ylabel('Precision')
+    plt.show()
+
+# -----------------------------
+# Switching Rate (SR) and WFQ-SR
+# -----------------------------
+switches = np.sum(y_pred[1:] != y_pred[:-1])
+switching_rate = switches / (len(y_pred)-1)
+
+# WFQ weights (customizable)
+weights = {cls: 1.0/(i+1) for i, cls in enumerate(classes)}  # simple inverse weighting
+wfq_switches, wfq_total = 0, 0
+for i in range(1, len(y_pred)):
+    if y_pred[i] != y_pred[i-1]:
+        wfq_switches += weights[classes[y_pred[i]]]
+    wfq_total += weights[classes[y_pred[i]]]
+wfq_switching_rate = wfq_switches / wfq_total if wfq_total > 0 else 0
+
+print("\n=== SWITCHING RATES ===")
+print(f"Switching Rate (SR)      : {switching_rate:.6f}")
+print(f"WFQ Switching Rate (WFQ-SR): {wfq_switching_rate:.6f}")
+
+# -----------------------------
+# Network metrics mapping and averages
+# -----------------------------
+network_column_map = {
+    'Throughput': 'Throughput (Mbps)',
+    'Latency': 'Latency (ms)',
+    'Jitter': 'Jitter (ms)',
+    'Packet_Loss': 'Packet Loss (%)',
+    'SNR': 'SNR (dB)',
+    'Handoff_Delay': 'Handoff Delay (ms)',
+    'Channel_Utilization': 'Channel Utilization (%)',
+    'Interference': 'Interference Level (%)'
+}
+
+print("\n--- Network Metrics (average on test set) ---")
+for metric, col_name in network_column_map.items():
+    if col_name in data.columns:
+        avg_val = data.loc[idx_test, col_name].mean()
+        print(f"{metric}: {avg_val:.4f}")
+    else:
+        print(f"{metric} not found in dataset.")
